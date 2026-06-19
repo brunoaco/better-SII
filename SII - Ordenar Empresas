@@ -1,0 +1,103 @@
+// ==UserScript==
+// @name         SII - Ordenar Empresas
+// @namespace    http://tampermonkey.net/
+// @version      1.5
+// @description  Ordena el select de empresas del portal SII. Toggle entre orden alfabético y numérico.
+// @author       Bruno
+// @match        https://www1.sii.cl/cgi-bin/Portal001/mipeSelEmpresa.cgi*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    if (window._siiSortLoaded) return;
+    window._siiSortLoaded = true;
+
+    let currentOrder = 'alpha';
+
+    function getRutNumeric(value) {
+        return parseInt(value.replace(/\./g, '').split('-')[0], 10) || 0;
+    }
+
+    function sortSelect(order) {
+        const optgroup = document.querySelector('select[name="RUT_EMP"] optgroup');
+        if (!optgroup) return;
+        const options = Array.from(optgroup.querySelectorAll('option'));
+        options.sort((a, b) =>
+            order === 'alpha'
+                ? a.textContent.trim().localeCompare(b.textContent.trim(), 'es', { sensitivity: 'base' })
+                : getRutNumeric(a.value) - getRutNumeric(b.value)
+        );
+        options.forEach(opt => optgroup.appendChild(opt));
+    }
+
+    function getLabel(order) {
+        return order === 'alpha' ? 'Empresas [A-Z]' : 'Empresas [0-9]';
+    }
+
+    function init() {
+        const label = document.querySelector('label[for="RUT_EMP"]');
+        const select = document.querySelector('select[name="RUT_EMP"]');
+        if (!label || !select) return;
+
+        sortSelect(currentOrder);
+
+        // Forzar el contenedor input-group a comportarse como flexbox
+        const inputGroup = select.closest('.input-group') || select.parentElement;
+        inputGroup.style.cssText +=
+            'display:flex !important;' +
+            'flex-direction:row !important;' +
+            'align-items:stretch !important;' +
+            'flex-wrap:nowrap !important;';
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.title = 'Cambiar orden';
+        btn.setAttribute('style',
+            'cursor:pointer;' +
+            'flex-shrink:0;' +
+            'width:auto;' +
+            'min-width:140px;' +
+            'font-size:13px;' +
+            'font-weight:600;' +
+            'font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;' +
+            'padding:6px 14px;' +
+            'border:1px solid #2563eb;' +
+            'border-radius:4px 0 0 4px;' +
+            'border-right:none;' +
+            'background:linear-gradient(135deg,#1d4ed8,#2563eb);' +
+            'color:#fff;' +
+            'white-space:nowrap;' +
+            'box-sizing:border-box;'
+        );
+        btn.textContent = getLabel(currentOrder);
+
+        // Ajustar select para pegarse al botón
+        select.style.cssText +=
+            'flex:1 !important;' +
+            'border-radius:0 4px 4px 0 !important;' +
+            'border-left:none !important;' +
+            'min-width:0 !important;';
+
+        btn.addEventListener('mouseenter', () => {
+            btn.style.background = 'linear-gradient(135deg,#1e40af,#1d4ed8)';
+        });
+        btn.addEventListener('mouseleave', () => {
+            btn.style.background = 'linear-gradient(135deg,#1d4ed8,#2563eb)';
+        });
+        btn.addEventListener('click', () => {
+            currentOrder = currentOrder === 'alpha' ? 'numeric' : 'alpha';
+            sortSelect(currentOrder);
+            btn.textContent = getLabel(currentOrder);
+        });
+
+        label.replaceWith(btn);
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();
