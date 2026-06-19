@@ -1,0 +1,346 @@
+// ==UserScript==
+// @name         SII BHE - Descarga Masiva PDFs
+// @namespace    http://tampermonkey.net/
+// @version      1.4
+// @description  Descarga PDFs de BHE desde el informe anual, mensual o diario
+// @author       Bruno
+// @match        https://loa.sii.cl/cgi_IMT/TMBCOC_InformeAnualBhe.cgi*
+// @match        https://loa.sii.cl/cgi_IMT/TMBCOC_InformeMensualBhe.cgi*
+// @match        https://loa.sii.cl/cgi_IMT/TMBCOC_InformeDiarioBhe.cgi*
+// @grant        GM_download
+// @grant        GM_xmlhttpRequest
+// @connect      loa.sii.cl
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const BASE_URL  = 'https://loa.sii.cl/cgi_IMT/';
+  const DELAY_MS  = 1200;
+
+  const path       = window.location.pathname;
+  const ES_ANUAL   = path.includes('InformeAnualBhe');
+  const ES_DIARIO  = path.includes('InformeDiarioBhe');
+  const ES_MENSUAL = path.includes('InformeMensualBhe');
+
+  const LABEL_BTN = ES_ANUAL
+    ? 'Iniciar descarga de todos los meses'
+    : ES_MENSUAL
+      ? 'Descargar boletas de este mes'
+      : 'Descargar boletas de este día';
+
+  // ─── UI Panel ────────────────────────────────────────────────────────────────
+  const panel = document.createElement('div');
+  panel.style.cssText = `
+    position:fixed; top:10px; right:10px; z-index:99999;
+    background:#002c48; color:#fff; padding:14px 18px;
+    border-radius:8px; font-family:Arial,sans-serif; font-size:13px;
+    min-width:300px; box-shadow:0 4px 12px rgba(0,0,0,0.4);
+  `;
+  panel.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <b style="font-size:14px;">⬇ Descarga Masiva BHE</b>
+      <span id="bhe-close" style="cursor:pointer;font-size:18px;line-height:1;color:#aaa;" title="Cerrar">✕</span>
+    </div>
+
+    <div id="bhe-status" style="margin-bottom:10px;">Listo. Presiona el botón para iniciar.</div>
+
+    ${ES_ANUAL ? `
+    <div id="bhe-block-meses" style="margin-bottom:8px;display:none;">
+      <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px;">
+        <span>Meses</span>
+        <span id="bhe-lbl-meses">0 / 0</span>
+      </div>
+      <div style="background:#001a2e;border-radius:4px;height:10px;overflow:hidden;">
+        <div id="bhe-bar-meses" style="height:10px;width:0%;background:#2ecc71;border-radius:4px;transition:width 0.3s;"></div>
+      </div>
+    </div>` : ''}
+
+    <div id="bhe-block-docs" style="margin-bottom:10px;display:none;">
+      <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px;">
+        <span id="bhe-lbl-docs-title">Documentos</span>
+        <span id="bhe-lbl-docs">0 / 0</span>
+      </div>
+      <div style="background:#001a2e;border-radius:4px;height:10px;overflow:hidden;">
+        <div id="bhe-bar-docs" style="height:10px;width:0%;background:#eb510d;border-radius:4px;transition:width 0.3s;"></div>
+      </div>
+    </div>
+
+    <div id="bhe-progress" style="font-size:11px;color:#aad4f5;min-height:28px;margin-bottom:10px;"></div>
+
+    <button id="bhe-btn" style="
+      background:#eb510d;color:#fff;border:none;padding:7px 16px;
+      border-radius:5px;cursor:pointer;font-size:13px;width:100%;
+    ">${LABEL_BTN}</button>
+  `;
+  document.body.appendChild(panel);
+
+  document.getElementById('bhe-close').addEventListener('click', () => panel.remove());
+  document.getElementById('bhe-btn').addEventListener('click', iniciarDescarga);
+
+  // ─── Helpers UI ──────────────────────────────────────────────────────────────
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+  function setStatus(msg)   { document.getElementById('bhe-status').textContent = msg; }
+  function setProgress(msg) { document.getElementById('bhe-progress').innerHTML = msg; }
+
+  function resetBtn() {
+    const btn = document.getElementById('bhe-btn');
+    if (btn) { btn.disabled = false; btn.textContent = LABEL_BTN; }
+  }
+
+  // Barra de meses (solo modo anual)
+  function initBarMeses(total) {
+    const block = document.getElementById('bhe-block-meses');
+    if (!block) return;
+    block.style.display = 'block';
+    document.getElementById('bhe-lbl-meses').textContent = `0 / ${total}`;
+    document.getElementById('bhe-bar-meses').style.width = '0%';
+  }
+
+  function updateBarMeses(done, total) {
+    const block = document.getElementById('bhe-block-meses');
+    if (!block) return;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    document.getElementById('bhe-lbl-meses').textContent = `${done} / ${total}`;
+    document.getElementById('bhe-bar-meses').style.width = `${pct}%`;
+  }
+
+  // Barra de documentos
+  function initBarDocs(label, total) {
+    const block = document.getElementById('bhe-block-docs');
+    block.style.display = 'block';
+    document.getElementById('bhe-lbl-docs-title').textContent = `Docs — ${label}`;
+    document.getElementById('bhe-lbl-docs').textContent = `0 / ${total}`;
+    document.getElementById('bhe-bar-docs').style.width = '0%';
+  }
+
+  function updateBarDocs(done, total) {
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    document.getElementById('bhe-lbl-docs').textContent = `${done} / ${total}`;
+    document.getElementById('bhe-bar-docs').style.width = `${pct}%`;
+  }
+
+  // ─── Leer datos del JS embebido ───────────────────────────────────────────────
+  function leerXmlValue(html, key) {
+    const m = html.match(new RegExp(`xml_values\\['${key}'\\]\\s*=\\s*"([^"]*)"`));
+    return m ? m[1] : '';
+  }
+
+  function getDatosActuales() {
+    const html = document.documentElement.innerHTML;
+    return {
+      rut:  leerXmlValue(html, 'rut_arrastre'),
+      dv:   leerXmlValue(html, 'dv_arrastre'),
+      anio: leerXmlValue(html, 'anio_consulta'),
+      mes:  leerXmlValue(html, 'mes_consulta'),
+      dia:  leerXmlValue(html, 'dia_consulta'),
+    };
+  }
+
+  // ─── Meses con emisiones (modo anual) ─────────────────────────────────────────
+  function getMesesConEmisiones() {
+    const links  = document.querySelectorAll('a[href*="TMBCOC_InformeMensualBhe.cgi"]');
+    const meses  = [];
+    const vistos = new Set();
+    links.forEach(a => {
+      const url  = new URL(a.href, window.location.href);
+      const mes  = url.searchParams.get('cbmesinformemensual');
+      const anio = url.searchParams.get('cbanoinformemensual');
+      const rut  = url.searchParams.get('rut_arrastre');
+      const dv   = url.searchParams.get('dv_arrastre');
+      if (mes && !vistos.has(mes)) {
+        vistos.add(mes);
+        meses.push({ mes, anio, rut, dv });
+      }
+    });
+    return meses;
+  }
+
+  // ─── Fetch páginas ────────────────────────────────────────────────────────────
+  function fetchPaginaMensual(mes, anio, rut, dv, pagina) {
+    return new Promise((resolve, reject) => {
+      const url = `${BASE_URL}TMBCOC_InformeMensualBhe.cgi?cbanoinformemensual=${anio}&cbmesinformemensual=${mes}&dv_arrastre=${dv}&pagina_solicitada=${pagina}&rut_arrastre=${rut}`;
+      GM_xmlhttpRequest({ method: 'GET', url, onload: r => resolve(r.responseText), onerror: reject });
+    });
+  }
+
+  function fetchPaginaDiaria(dia, mes, anio, rut, dv, pagina) {
+    return new Promise((resolve, reject) => {
+      const url = `${BASE_URL}TMBCOC_InformeDiarioBhe.cgi?cbanoinformediario=${anio}&cbmesinformediario=${mes}&cbdiainformediario=${dia}&dv_arrastre=${dv}&pagina_solicitada=${pagina}&rut_arrastre=${rut}`;
+      GM_xmlhttpRequest({ method: 'GET', url, onload: r => resolve(r.responseText), onerror: reject });
+    });
+  }
+
+  // ─── Parsear boletas ──────────────────────────────────────────────────────────
+  function parsearBoletas(html, esDiario = false) {
+    const prefix = esDiario ? 'arr_informe_diario' : 'arr_informe_mensual';
+
+    const total     = parseInt(leerXmlValue(html, 'total_boletas') || '0');
+    const rutEmisor = leerXmlValue(html, 'rut_arrastre');
+    const dvEmisor  = leerXmlValue(html, 'dv_arrastre');
+    const anio      = leerXmlValue(html, 'anio_consulta');
+    const mes       = leerXmlValue(html, 'mes_consulta');
+    const dia       = leerXmlValue(html, 'dia_consulta');
+
+    const nroRe    = new RegExp(`${prefix}\\['nroboleta_(\\d+)'\\]\\s*=\\s*"([^"]+)"`, 'g');
+    const cbRe     = new RegExp(`${prefix}\\['codigobarras_(\\d+)'\\]\\s*=\\s*"([^"]+)"`, 'g');
+    const estadoRe = new RegExp(`${prefix}\\['estado_(\\d+)'\\]\\s*=\\s*"([^"]+)"`, 'g');
+
+    const nros = {}, cbs = {}, estados = {};
+    let m;
+    while ((m = nroRe.exec(html))    !== null) nros[m[1]]    = m[2];
+    while ((m = cbRe.exec(html))     !== null) cbs[m[1]]     = m[2];
+    while ((m = estadoRe.exec(html)) !== null) estados[m[1]] = m[2];
+
+    const boletas = Object.keys(nros).map(idx => ({
+      folio:        nros[idx],
+      codigoBarras: cbs[idx],
+      estado:       estados[idx],
+      rutEmisor, dvEmisor, anio, mes, dia,
+    }));
+
+    return { boletas, total };
+  }
+
+  // ─── Nombre de archivo ────────────────────────────────────────────────────────
+  function nombreArchivo(boleta) {
+    const fecha = boleta.dia
+      ? `${boleta.anio}-${boleta.mes.padStart(2,'0')}-${boleta.dia.padStart(2,'0')}`
+      : `${boleta.anio}-${boleta.mes.padStart(2,'0')}`;
+    return `${boleta.rutEmisor}-${boleta.dvEmisor}_${boleta.folio}_${fecha}.pdf`;
+  }
+
+  // ─── Descarga un PDF ──────────────────────────────────────────────────────────
+  function descargarPdf(boleta) {
+    return new Promise((resolve, reject) => {
+      const url    = `${BASE_URL}TMBCOT_ConsultaBoletaPdf.cgi?txt_codigobarras=${boleta.codigoBarras}&veroriginal=si&origen=PROPIOS&enviar=si`;
+      const nombre = nombreArchivo(boleta);
+      GM_download({ url, name: nombre, onload: () => resolve(nombre), onerror: reject });
+    });
+  }
+
+  // ─── Descargar lista de boletas (con barra de docs) ───────────────────────────
+  async function descargarLista(boletas, label) {
+    let descargadas = 0, omitidas = 0, errores = 0;
+
+    // Boletas vigentes (las que realmente se van a descargar)
+    const vigentes = boletas.filter(b => b.estado !== 'A');
+    const totalVigentes = vigentes.length;
+    const totalAnuladas = boletas.length - totalVigentes;
+
+    initBarDocs(label, totalVigentes);
+
+    for (const boleta of boletas) {
+      if (boleta.estado === 'A') {
+        omitidas++;
+        setProgress(`⏭ Omitida (anulada): folio ${boleta.folio} — ${label}`);
+        continue;
+      }
+      try {
+        const nombre = await descargarPdf(boleta);
+        descargadas++;
+        updateBarDocs(descargadas, totalVigentes);
+        setProgress(`✅ <b>${nombre}</b>`);
+      } catch (e) {
+        errores++;
+        setProgress(`❌ Error folio ${boleta.folio} — ${label}`);
+        console.error('Error descarga BHE:', e);
+      }
+      await sleep(DELAY_MS);
+    }
+
+    return { descargadas, omitidas: totalAnuladas, errores };
+  }
+
+  // ─── Procesar mes (fetch + paginación) ───────────────────────────────────────
+  async function procesarMes(mes, anio, rut, dv) {
+    const label = `${anio}-${mes.padStart(2,'0')}`;
+    setProgress(`📅 Cargando mes <b>${label}</b>…`);
+
+    let todasLasBoletas = [], pagina = 0, totalBoletas = 0;
+    do {
+      const html = await fetchPaginaMensual(mes, anio, rut, dv, pagina);
+      const { boletas, total } = parsearBoletas(html, false);
+      todasLasBoletas = todasLasBoletas.concat(boletas);
+      totalBoletas = total;
+      pagina++;
+      await sleep(500);
+    } while (todasLasBoletas.length < totalBoletas && totalBoletas > 100);
+
+    return descargarLista(todasLasBoletas, label);
+  }
+
+  // ─── Procesar día (fetch + paginación) ───────────────────────────────────────
+  async function procesarDia(dia, mes, anio, rut, dv) {
+    const label = `${anio}-${mes.padStart(2,'0')}-${dia.padStart(2,'0')}`;
+    setProgress(`📆 Cargando día <b>${label}</b>…`);
+
+    let todasLasBoletas = [], pagina = 1, totalBoletas = 0;
+    do {
+      const html = await fetchPaginaDiaria(dia, mes, anio, rut, dv, pagina);
+      const { boletas, total } = parsearBoletas(html, true);
+      todasLasBoletas = todasLasBoletas.concat(boletas);
+      totalBoletas = total;
+      pagina++;
+      await sleep(500);
+    } while (todasLasBoletas.length < totalBoletas && totalBoletas > 100);
+
+    return descargarLista(todasLasBoletas, label);
+  }
+
+  // ─── Flujo principal ──────────────────────────────────────────────────────────
+  async function iniciarDescarga() {
+    const btn = document.getElementById('bhe-btn');
+    btn.disabled = true;
+    btn.textContent = 'Procesando...';
+
+    // ── Modo diario ───────────────────────────────────────────────────────────
+    if (ES_DIARIO) {
+      const { rut, dv, anio, mes, dia } = getDatosActuales();
+      if (!rut || !dia) { setStatus('⚠ No se pudieron leer los datos del día.'); resetBtn(); return; }
+      const label = `${anio}-${mes.padStart(2,'0')}-${dia.padStart(2,'0')}`;
+      setStatus(`Procesando día ${label}…`);
+      const { descargadas, omitidas, errores } = await procesarDia(dia, mes, anio, rut, dv);
+      setStatus(`✅ Listo: ${descargadas} descargadas, ${omitidas} omitidas, ${errores} errores.`);
+      btn.textContent = 'Descarga completada';
+      return;
+    }
+
+    // ── Modo mensual ──────────────────────────────────────────────────────────
+    if (ES_MENSUAL) {
+      const { rut, dv, anio, mes } = getDatosActuales();
+      if (!rut || !mes) { setStatus('⚠ No se pudieron leer los datos del mes.'); resetBtn(); return; }
+      const label = `${anio}-${mes.padStart(2,'0')}`;
+      setStatus(`Procesando mes ${label}…`);
+      const { descargadas, omitidas, errores } = await procesarMes(mes, anio, rut, dv);
+      setStatus(`✅ Listo: ${descargadas} descargadas, ${omitidas} omitidas, ${errores} errores.`);
+      btn.textContent = 'Descarga completada';
+      return;
+    }
+
+    // ── Modo anual ────────────────────────────────────────────────────────────
+    const meses = getMesesConEmisiones();
+    if (meses.length === 0) {
+      setStatus('⚠ No se encontraron meses con emisiones.');
+      resetBtn();
+      return;
+    }
+
+    initBarMeses(meses.length);
+    setStatus(`${meses.length} mes(es) con emisiones encontrados.`);
+    let grand = { descargadas: 0, omitidas: 0, errores: 0 };
+
+    for (let i = 0; i < meses.length; i++) {
+      const { mes, anio, rut, dv } = meses[i];
+      const r = await procesarMes(mes, anio, rut, dv);
+      grand.descargadas += r.descargadas;
+      grand.omitidas    += r.omitidas;
+      grand.errores     += r.errores;
+      updateBarMeses(i + 1, meses.length);
+    }
+
+    setStatus(`✅ Listo: ${grand.descargadas} descargadas, ${grand.omitidas} omitidas, ${grand.errores} errores.`);
+    btn.textContent = 'Descarga completada';
+  }
+
+})();
