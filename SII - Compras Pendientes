@@ -1,0 +1,375 @@
+// ==UserScript==
+// @name         SII - Compras Pendientes
+// @namespace    http://tampermonkey.net/
+// @version      2.0
+// @description  Consulta y acuse masivo de compras pendientes por RUT
+// @author       Bruno
+// @match        https://www4.sii.cl/consdcvinternetui/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  const waitFor = (condFn, timeout = 15000, interval = 400) => {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
+      const check = () => {
+        if (condFn()) return resolve(true);
+        if (Date.now() - start > timeout) return reject('Timeout');
+        setTimeout(check, interval);
+      };
+      check();
+    });
+  };
+
+  // Esperar a que Angular y el select estén listos
+  await new Promise((resolve) => {
+    const check = setInterval(() => {
+      const sel = document.querySelector('select[name="rut"]');
+      if (sel && sel.options.length > 1) { clearInterval(check); resolve(); }
+    }, 600);
+  });
+  await sleep(1000);
+
+  // --- MODAL DE CONFIRMACIÓN INICIAL ---
+  const esperarConfirmacion = () => new Promise((resolve) => {
+    const modalId = 'sii-confirm-modal';
+    document.getElementById(modalId)?.remove();
+
+    const selectEl = document.querySelector('select[name="rut"]');
+    const ruts = selectEl
+      ? [...selectEl.options].filter(o => o.value !== '').map(o => o.value)
+      : [];
+
+    const overlay = document.createElement('div');
+    overlay.id = modalId;
+    overlay.style.cssText = `
+      position:fixed; inset:0; z-index:999999;
+      background:rgba(0,0,0,0.6);
+      display:flex; align-items:center; justify-content:center;
+    `;
+    overlay.innerHTML = `
+      <div style="
+        background:#1e1e2e; color:#cdd6f4;
+        font-family:monospace; font-size:13px;
+        border-radius:12px; padding:28px 32px;
+        box-shadow:0 8px 32px rgba(0,0,0,0.6);
+        border:1px solid #313244;
+        max-width:420px; width:90%; text-align:center;
+      ">
+        <div style="font-size:32px; margin-bottom:12px;">🔍</div>
+        <div style="font-size:15px; font-weight:bold; color:#cba6f7; margin-bottom:10px;">
+          Consulta y Acuse de Compras Pendientes
+        </div>
+        <div style="color:#bac2de; margin-bottom:6px;">
+          Se consultará <strong style="color:#89b4fa;">Pendientes</strong> para:
+        </div>
+        <div style="background:#313244; border-radius:8px; padding:10px; margin:12px 0; color:#a6e3a1; font-size:14px;">
+          📋 <strong>${ruts.length}</strong> RUTs del período actual
+        </div>
+        <div style="background:#45475a; border-radius:8px; padding:8px; margin:8px 0; color:#f9e2af; font-size:11px;">
+          ⚠️ El acuse de recibo <strong>no puede ser reversado</strong>.<br>
+          Solo se procesarán documentos con pendientes > 0.
+        </div>
+        <div style="color:#6c7086; font-size:11px; margin-bottom:20px;">
+          Tiempo estimado: ~${Math.ceil(ruts.length * 6 / 60)} min.<br>
+          No cierres ni recargues la página.
+        </div>
+        <div style="display:flex; gap:12px; justify-content:center;">
+          <button id="sii-btn-cancelar" style="
+            background:#313244; color:#f38ba8;
+            border:1px solid #f38ba8; padding:9px 24px;
+            border-radius:8px; cursor:pointer; font-family:monospace; font-size:13px;
+          ">✕ Cancelar</button>
+          <button id="sii-btn-confirmar" style="
+            background:#a6e3a1; color:#1e1e2e;
+            border:none; padding:9px 24px; border-radius:8px;
+            cursor:pointer; font-family:monospace; font-size:13px; font-weight:bold;
+          ">▶ Iniciar</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    document.getElementById('sii-btn-confirmar').onclick = () => { overlay.remove(); resolve(true); };
+    document.getElementById('sii-btn-cancelar').onclick  = () => { overlay.remove(); resolve(false); };
+  });
+
+  const confirmado = await esperarConfirmacion();
+  if (!confirmado) return;
+
+  // --- PANEL VISUAL ---
+  const panelId = 'sii-progress-panel';
+  document.getElementById(panelId)?.remove();
+  const panel = document.createElement('div');
+  panel.id = panelId;
+  panel.style.cssText = `
+    position:fixed; top:20px; right:20px; z-index:99999;
+    width:400px; max-height:85vh; overflow-y:auto;
+    background:#1e1e2e; color:#cdd6f4;
+    font-family:monospace; font-size:12px;
+    border-radius:10px; box-shadow:0 4px 20px rgba(0,0,0,0.5);
+    border:1px solid #313244;
+  `;
+  panel.innerHTML = `
+    <div style="background:#313244; padding:10px 14px; border-radius:10px 10px 0 0;
+                display:flex; justify-content:space-between; align-items:center;">
+      <span style="font-weight:bold; color:#cba6f7;">🔍 SII — Compras Pendientes</span>
+      <button onclick="document.getElementById('${panelId}').remove()"
+        style="background:none;border:none;color:#f38ba8;cursor:pointer;font-size:16px;">✕</button>
+    </div>
+    <div style="padding:10px 14px;">
+      <div style="margin-bottom:8px;">
+        <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+          <span id="sii-progress-label">Iniciando...</span>
+          <span id="sii-progress-pct" style="color:#a6e3a1;">0%</span>
+        </div>
+        <div style="background:#45475a; border-radius:4px; height:8px; overflow:hidden;">
+          <div id="sii-progress-bar" style="height:100%;width:0%;background:#a6e3a1;transition:width 0.3s;"></div>
+        </div>
+      </div>
+      <div id="sii-current" style="color:#89b4fa; margin-bottom:8px; min-height:16px;"></div>
+      <div id="sii-log" style="max-height:380px;overflow-y:auto;border-top:1px solid #313244;padding-top:8px;"></div>
+    </div>
+  `;
+  document.body.appendChild(panel);
+
+  const setProgress = (current, total) => {
+    const pct = Math.round((current / total) * 100);
+    document.getElementById('sii-progress-bar').style.width = pct + '%';
+    document.getElementById('sii-progress-pct').textContent = pct + '%';
+    document.getElementById('sii-progress-label').textContent = `RUT ${current} de ${total}`;
+  };
+  const setCurrent = txt => document.getElementById('sii-current').textContent = txt;
+  const addLog = (txt, color = '#a6e3a1') => {
+    const log = document.getElementById('sii-log');
+    const el = document.createElement('div');
+    el.style.cssText = `padding:3px 0; border-bottom:1px solid #313244; color:${color};`;
+    el.textContent = txt;
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+  };
+
+  // --- HELPERS ---
+  const sinPendientesVisible = () =>
+    [...document.querySelectorAll('.ng-scope')].some(el =>
+      el.children.length === 0 && (
+        el.textContent.includes('No hay información de Pendientes') ||
+        el.textContent.includes('Sin información')
+      )
+    );
+
+  const tablaVisible = () => !!document.querySelector('table.table tbody tr');
+  const pendientesListas = () => tablaVisible() || sinPendientesVisible();
+
+  const modalVisible = (texto) =>
+    [...document.querySelectorAll('.modal.in, .modal[style*="block"]')]
+      .some(m => m.textContent.includes(texto));
+
+  const clickAngular = (el) => {
+    el.click();
+    try {
+      const scope = angular.element(el).scope();
+      if (scope) scope.$apply();
+    } catch(e) {}
+  };
+
+  const cerrarModalAlerta = async () => {
+    // Cerrar modal de alerta "No se encontraron documentos"
+    const btnCerrar = [...document.querySelectorAll('.modal.in button, .modal[style*="block"] button')]
+      .find(b => b.textContent.trim() === 'Cerrar' && b.classList.contains('btn-danger'));
+    if (btnCerrar) { btnCerrar.click(); await sleep(500); }
+  };
+
+  // --- PROCESAR ACUSE PARA UN TIPO DE DOCUMENTO ---
+  const procesarAcuse = async (rut, linkEl, tipoDoc) => {
+    addLog(`   📂 Abriendo: ${tipoDoc}`, '#89b4fa');
+
+    // 1. Click en el link del tipo de documento
+    linkEl.click();
+    await sleep(1500);
+
+    // 2. Esperar tabla #tableCompra
+    try {
+      await waitFor(() => {
+        const tabla = document.querySelector('#tableCompra');
+        return tabla && tabla.querySelectorAll('tbody tr').length > 0;
+      }, 12000);
+    } catch(e) {
+      addLog(`   ⏱️ Timeout esperando tabla: ${tipoDoc}`, '#f38ba8');
+      return;
+    }
+    await sleep(500);
+
+    // 3. Click select_all
+    const checkAll = document.querySelector('#select_all');
+    if (!checkAll) { addLog(`   ⚠️ No se encontró checkbox select_all`, '#f9e2af'); return; }
+    checkAll.click();
+    await sleep(500);
+
+    // 4. Click "Acuse de Recibo Masivo"
+    const btnAcuse = [...document.querySelectorAll('button')]
+      .find(b => b.textContent.includes('Acuse de Recibo Masivo'));
+    if (!btnAcuse) { addLog(`   ⚠️ No se encontró botón Acuse Masivo`, '#f9e2af'); return; }
+    btnAcuse.click();
+    await sleep(1000);
+
+    // 5. Esperar modal 1 y seleccionar ERM
+    try {
+      await waitFor(() => modalVisible('Acuse de Recibo Masivo'), 8000);
+    } catch(e) {
+      addLog(`   ⏱️ Timeout esperando modal Acuse Masivo`, '#f38ba8');
+      return;
+    }
+
+    const selectEvento = document.querySelector('#evento');
+    if (!selectEvento) { addLog(`   ⚠️ No se encontró select de evento`, '#f9e2af'); return; }
+
+    // Seleccionar ERM via Angular
+    const scopeSelect = angular.element(selectEvento).scope();
+    scopeSelect.$apply(() => { scopeSelect.evento = 'ERM'; });
+    selectEvento.value = 'ERM';
+    await sleep(500);
+
+    // 6. Click "Confirmar"
+    const btnConfirmar = [...document.querySelectorAll('.modal.in button, .modal[style*="block"] button')]
+      .find(b => b.textContent.trim() === 'Confirmar' && b.type === 'submit');
+    if (!btnConfirmar) { addLog(`   ⚠️ No se encontró botón Confirmar`, '#f9e2af'); return; }
+    btnConfirmar.click();
+    await sleep(1000);
+
+    // 7. Esperar modal 2 de confirmación y click "Aceptar"
+    try {
+      await waitFor(() => modalVisible('¿Esta seguro'), 8000);
+    } catch(e) {
+      addLog(`   ⏱️ Timeout esperando modal confirmación`, '#f38ba8');
+      return;
+    }
+
+    const btnAceptar = [...document.querySelectorAll('.modal.in button, .modal[style*="block"] button')]
+      .find(b => b.getAttribute('ng-click') === 'acusarReclamar()');
+    if (!btnAceptar) { addLog(`   ⚠️ No se encontró botón Aceptar`, '#f9e2af'); return; }
+    btnAceptar.click();
+    await sleep(2000);
+
+    // 8. Esperar modal 3 de resultados y cerrarlo
+    try {
+      await waitFor(() => modalVisible('Resultado Acuse'), 10000);
+      const btnCerrar = [...document.querySelectorAll('.modal.in button, .modal[style*="block"] button')]
+        .find(b => b.getAttribute('ng-click') === 'close()');
+      if (btnCerrar) { btnCerrar.click(); await sleep(800); }
+      addLog(`   ✅ Acuse completado: ${tipoDoc}`, '#a6e3a1');
+    } catch(e) {
+      // Puede que haya aparecido la alerta de "No se encontraron documentos"
+      await cerrarModalAlerta();
+      addLog(`   ℹ️ Sin documentos para acusar: ${tipoDoc}`, '#6c7086');
+    }
+
+    await sleep(800);
+
+    // 9. Volver a la vista de pendientes
+    const tabPendiente = document.querySelector('a[ui-sref="compraPendiente"]');
+    if (tabPendiente) { tabPendiente.click(); await sleep(1000); }
+  };
+
+  // --- LÓGICA PRINCIPAL ---
+  const selectEl = document.querySelector('select[name="rut"]');
+  if (!selectEl) return console.error('❌ No se encontró el select de RUTs');
+
+  const ruts = [...selectEl.options]
+    .filter(o => o.value !== '')
+    .map(o => o.value);
+
+  const resultados = [];
+
+  for (let i = 0; i < ruts.length; i++) {
+    const rut = ruts[i];
+    setCurrent(`⏳ Consultando: ${rut}`);
+    setProgress(i + 1, ruts.length);
+    addLog(`\n🔄 [${i+1}/${ruts.length}] RUT: ${rut}`, '#cba6f7');
+
+    // Seleccionar RUT
+    const sel = document.querySelector('select[name="rut"]');
+    const scope = angular.element(sel).scope();
+    scope.$apply(() => { scope.rut = rut; });
+    sel.value = rut;
+    await sleep(300);
+
+    // Consultar
+    document.querySelector('button[type="submit"]').click();
+    await sleep(1200);
+
+    // Esperar pestaña Pendientes
+    try {
+      await waitFor(() => !!document.querySelector('a[ui-sref="compraPendiente"]'), 15000);
+    } catch(e) {
+      addLog(`⏱️ Timeout pestaña — RUT ${rut}`, '#f38ba8');
+      resultados.push({ rut, totalDocumentos: 'timeout_tab', detalle: [] });
+      continue;
+    }
+
+    // Click Pendientes
+    document.querySelector('a[ui-sref="compraPendiente"]').click();
+    await sleep(800);
+
+    // Esperar contenido
+    try {
+      await waitFor(pendientesListas, 15000);
+    } catch(e) {
+      addLog(`⏱️ Timeout contenido — RUT ${rut}`, '#f38ba8');
+      resultados.push({ rut, totalDocumentos: 'timeout_contenido', detalle: [] });
+      continue;
+    }
+    await sleep(300);
+
+    // Sin pendientes
+    if (sinPendientesVisible()) {
+      addLog(`   ℹ️ Sin pendientes`, '#6c7086');
+      resultados.push({ rut, totalDocumentos: 0, detalle: [] });
+      continue;
+    }
+
+    // Leer links con pendientes > 0 desde la tabla resumen
+    const linksConPendientes = [];
+    document.querySelectorAll('table.table tbody tr').forEach(tr => {
+      const celdas = tr.querySelectorAll('td');
+      if (celdas.length >= 2) {
+        const cantidad = parseInt(celdas[1].textContent.trim().replace(/\./g, '')) || 0;
+        const link = celdas[0].querySelector('a[href*="detalle"]');
+        if (cantidad > 0 && link) {
+          linksConPendientes.push({ link, tipoDoc: link.textContent.trim(), cantidad });
+        }
+      }
+    });
+
+    if (linksConPendientes.length === 0) {
+      addLog(`   ℹ️ Sin links con pendientes > 0`, '#6c7086');
+      resultados.push({ rut, totalDocumentos: 0, detalle: [] });
+      continue;
+    }
+
+    const total = linksConPendientes.reduce((s, l) => s + l.cantidad, 0);
+    addLog(`   ⚠️ ${total} pendientes en ${linksConPendientes.length} tipo(s)`, '#f9e2af');
+
+    // Procesar acuse para cada tipo de documento
+    for (const { link, tipoDoc, cantidad } of linksConPendientes) {
+      addLog(`   📋 ${tipoDoc}: ${cantidad} docs`, '#f9e2af');
+      await procesarAcuse(rut, link, tipoDoc);
+    }
+
+    resultados.push({ rut, totalDocumentos: total, detalle: linksConPendientes.map(l => ({ tipoDoc: l.tipoDoc, cantidad: l.cantidad })) });
+    await sleep(1000);
+  }
+
+  // Resumen final
+  setCurrent('✔ Proceso completado');
+  const conPendientes = resultados.filter(r => r.totalDocumentos > 0);
+  addLog(`\n========== RESUMEN FINAL ==========`, '#cba6f7');
+  addLog(`✅ RUTs procesados: ${resultados.length}`, '#a6e3a1');
+  addLog(`⚠️ Con pendientes acusados: ${conPendientes.length}`, '#f9e2af');
+  if (conPendientes.length === 0) addLog(`🎉 Sin pendientes en ningún RUT`, '#a6e3a1');
+
+  console.log('\n📋 JSON:', JSON.stringify(resultados, null, 2));
+
+})();
