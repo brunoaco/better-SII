@@ -1,0 +1,230 @@
+// ==UserScript==
+// @name         SII - Descarga de PDFs
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Descarga automática de PDFs desde el listado de documentos emitidos
+// @author       Bruno
+// @match        https://www1.sii.cl/cgi-bin/Portal001/mipeAdminDocsEmi.cgi*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // Esperar a que el DataTable esté listo
+  await new Promise((resolve) => {
+    const check = setInterval(() => {
+      if (typeof $ !== 'undefined' && $.fn.dataTable && $.fn.dataTable.isDataTable('#tablaDatos')) {
+        clearInterval(check);
+        resolve();
+      }
+    }, 500);
+  });
+
+  await sleep(800);
+
+  // --- MODAL DE CONFIRMACIÓN ---
+  const esperarConfirmacion = () => new Promise((resolve) => {
+    const modalId = 'sii-pdf-confirm';
+    document.getElementById(modalId)?.remove();
+
+    const tabla = $('#tablaDatos').DataTable();
+    const total = tabla.rows().count();
+
+    const empresaDiv = document.querySelector('.col-sm-3.text-right');
+    const texto = empresaDiv?.textContent.trim() || '';
+    const rutMatch = texto.match(/[\d\.]+\-[\dkK]/);
+    const rutEmpresa = rutMatch ? rutMatch[0].replace(/\./g, '') : 'RUT_DESCONOCIDO';
+
+    const overlay = document.createElement('div');
+    overlay.id = modalId;
+    overlay.style.cssText = `
+      position:fixed; inset:0; z-index:999999;
+      background:rgba(0,0,0,0.6);
+      display:flex; align-items:center; justify-content:center;
+    `;
+    overlay.innerHTML = `
+      <div style="
+        background:#1e1e2e; color:#cdd6f4;
+        font-family:monospace; font-size:13px;
+        border-radius:12px; padding:28px 32px;
+        box-shadow:0 8px 32px rgba(0,0,0,0.6);
+        border:1px solid #313244;
+        max-width:420px; width:90%;
+        text-align:center;
+      ">
+        <div style="font-size:32px; margin-bottom:12px;">📥</div>
+        <div style="font-size:15px; font-weight:bold; color:#cba6f7; margin-bottom:10px;">
+          Descarga de PDFs — SII
+        </div>
+        <div style="color:#bac2de; margin-bottom:6px;">
+          Empresa activa:
+        </div>
+        <div style="background:#313244; border-radius:8px; padding:8px; margin:8px 0; color:#89b4fa;">
+          🏢 ${rutEmpresa}
+        </div>
+        <div style="background:#313244; border-radius:8px; padding:10px; margin:12px 0; color:#a6e3a1; font-size:14px;">
+          📋 <strong>${total}</strong> documentos en el listado actual
+        </div>
+        <div style="color:#6c7086; font-size:11px; margin-bottom:20px;">
+          Se descargarán exactamente los documentos visibles en la tabla.<br>
+          No cierres ni recargues la página mientras corre.
+        </div>
+        <div style="display:flex; gap:12px; justify-content:center;">
+          <button id="sii-pdf-cancelar" style="
+            background:#313244; color:#f38ba8;
+            border:1px solid #f38ba8;
+            padding:9px 24px; border-radius:8px;
+            cursor:pointer; font-family:monospace; font-size:13px;
+          ">✕ Cancelar</button>
+          <button id="sii-pdf-confirmar" style="
+            background:#a6e3a1; color:#1e1e2e;
+            border:none; padding:9px 24px; border-radius:8px;
+            cursor:pointer; font-family:monospace; font-size:13px; font-weight:bold;
+          ">▶ Descargar PDFs</button>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(overlay);
+    document.getElementById('sii-pdf-confirmar').onclick = () => { overlay.remove(); resolve(true); };
+    document.getElementById('sii-pdf-cancelar').onclick  = () => { overlay.remove(); resolve(false); };
+  });
+
+  const confirmado = await esperarConfirmacion();
+  if (!confirmado) return;
+
+  // --- RUT EMPRESA ---
+  const empresaDiv = document.querySelector('.col-sm-3.text-right');
+  const texto = empresaDiv?.textContent.trim() || '';
+  const rutMatch = texto.match(/[\d\.]+\-[\dkK]/);
+  const rutEmpresa = rutMatch ? rutMatch[0].replace(/\./g, '') : 'RUT_DESCONOCIDO';
+
+  // --- EXTRAER DATOS DEL DATATABLE ---
+  const tabla = $('#tablaDatos').DataTable();
+  const codigos = [];
+
+  tabla.rows().data().each((row) => {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(row[0], 'text/html');
+    const link = doc.querySelector('a[href*="CODIGO="]');
+    if (link) {
+      const codigo      = new URLSearchParams(link.href.split('?')[1]).get('CODIGO');
+      const rutContra   = row[1].trim().replace(/\s/g, '');
+      const razonSocial = row[2].trim()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9\s]/g, '')
+        .trim()
+        .replace(/\s+/g, '-')
+        .replace(/-+/g, '-')
+        .substring(0, 20);
+      const tipo  = row[3].trim();
+      const folio = row[4].trim().padStart(6, '0');
+      const fecha = row[5].trim().replace(/-/g, '');
+      if (codigo) codigos.push({ codigo, rutContra, razonSocial, tipo, folio, fecha });
+    }
+  });
+
+  const normalizarTipo = (tipo) => tipo
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, '')
+    .replace(/[^a-zA-Z0-9]/g, '');
+
+  // --- PANEL VISUAL ---
+  const panelId = 'sii-pdf-panel';
+  document.getElementById(panelId)?.remove();
+  const panel = document.createElement('div');
+  panel.id = panelId;
+  panel.style.cssText = `
+    position:fixed; top:20px; right:20px; z-index:99999;
+    width:400px; max-height:85vh; overflow-y:auto;
+    background:#1e1e2e; color:#cdd6f4;
+    font-family:monospace; font-size:12px;
+    border-radius:10px; box-shadow:0 4px 20px rgba(0,0,0,0.5);
+    border:1px solid #313244;
+  `;
+  panel.innerHTML = `
+    <div style="background:#313244; padding:10px 14px; border-radius:10px 10px 0 0;
+                display:flex; justify-content:space-between; align-items:center;">
+      <span style="font-weight:bold; color:#cba6f7;">📥 SII — Descarga de PDFs</span>
+      <button onclick="document.getElementById('${panelId}').remove()"
+        style="background:none;border:none;color:#f38ba8;cursor:pointer;font-size:16px;">✕</button>
+    </div>
+    <div style="padding:10px 14px;">
+      <div style="margin-bottom:8px;">
+        <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+          <span id="sii-pdf-label">Iniciando...</span>
+          <span id="sii-pdf-pct" style="color:#a6e3a1;">0%</span>
+        </div>
+        <div style="background:#45475a; border-radius:4px; height:8px; overflow:hidden;">
+          <div id="sii-pdf-bar" style="height:100%;width:0%;background:#a6e3a1;transition:width 0.3s;"></div>
+        </div>
+      </div>
+      <div id="sii-pdf-current" style="color:#89b4fa; margin-bottom:8px; min-height:16px;"></div>
+      <div id="sii-pdf-log" style="max-height:400px;overflow-y:auto;border-top:1px solid #313244;padding-top:8px;"></div>
+    </div>
+  `;
+  document.body.appendChild(panel);
+
+  const setProgress = (current, total) => {
+    const pct = Math.round((current / total) * 100);
+    document.getElementById('sii-pdf-bar').style.width = pct + '%';
+    document.getElementById('sii-pdf-pct').textContent = pct + '%';
+    document.getElementById('sii-pdf-label').textContent = `Factura ${current} de ${total}`;
+  };
+  const setCurrent = txt => document.getElementById('sii-pdf-current').textContent = txt;
+  const addLog = (txt, color = '#a6e3a1') => {
+    const log = document.getElementById('sii-pdf-log');
+    const el = document.createElement('div');
+    el.style.cssText = `padding:2px 0; border-bottom:1px solid #313244; color:${color};`;
+    el.textContent = txt;
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+  };
+
+  // --- DESCARGAR CADA PDF ---
+  const BASE_URL = 'https://www1.sii.cl/cgi-bin/Portal001/mipeDisplayPDF.cgi';
+  let descargados = 0;
+  let errores = 0;
+
+  for (let i = 0; i < codigos.length; i++) {
+    const { codigo, rutContra, razonSocial, tipo, folio, fecha } = codigos[i];
+    const tipoNorm = normalizarTipo(tipo);
+    const nombreArchivo = `${tipoNorm}_${rutEmpresa}_${folio}_${rutContra}_${razonSocial}_${fecha}.pdf`;
+
+    setProgress(i + 1, codigos.length);
+    setCurrent(`⏳ ${nombreArchivo}`);
+
+    try {
+      const res = await fetch(`${BASE_URL}?DHDR_CODIGO=${codigo}`, { credentials: 'include' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const blob = await res.blob();
+      if (blob.size < 500) throw new Error('PDF vacío o inválido');
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = nombreArchivo;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      descargados++;
+      addLog(`✅ [${i+1}/${codigos.length}] ${nombreArchivo}`, '#a6e3a1');
+    } catch (e) {
+      errores++;
+      addLog(`❌ [${i+1}/${codigos.length}] Folio ${folio}: ${e.message}`, '#f38ba8');
+    }
+
+    await sleep(700);
+  }
+
+  setProgress(codigos.length, codigos.length);
+  setCurrent('✔ Descarga finalizada');
+  addLog(`─────────────────────────`, '#313244');
+  addLog(`📦 Total: ${codigos.length} | ✅ OK: ${descargados} | ❌ Errores: ${errores}`, '#cba6f7');
+
+})();
