@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SII - Ordenar Empresas
 // @namespace    http://tampermonkey.net/
-// @version      1.5
-// @description  Ordena el select de empresas del portal SII. Toggle entre orden alfabético y numérico.
+// @version      2.1
+// @description  Ordena el select de empresas del portal SII. Toggle entre orden alfabético (Nombre RUT) y numérico (RUT Nombre).
 // @author       Bruno
 // @match        https://www1.sii.cl/cgi-bin/Portal001/mipeSelEmpresa.cgi*
 // @grant        none
@@ -14,90 +14,151 @@
     if (window._siiSortLoaded) return;
     window._siiSortLoaded = true;
 
-    let currentOrder = 'alpha';
+    const STORAGE_KEY = 'sii_sort_order';
+    let currentOrder = localStorage.getItem(STORAGE_KEY) || 'alpha';
 
-    function getRutNumeric(value) {
-        return parseInt(value.replace(/\./g, '').split('-')[0], 10) || 0;
+    // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+    // El formato real es "NOMBRE RUT" donde el RUT es la última "palabra" (ej: 19197270-8)
+    // Usamos regex para extraer el RUT del final del string
+    const RUT_REGEX = /^(.*?)\s+([\dkK]{1,8}-[\dkK])[\s\n\r]*$/;
+
+    function parseOption(text) {
+        const trimmed = text.trim().replace(/\s+/g, ' ');
+        const match = trimmed.match(RUT_REGEX);
+        if (!match) return { nombre: trimmed, rut: '' };
+        return {
+            nombre: match[1].trim(),
+            rut:    match[2].trim()
+        };
     }
 
-    function sortSelect(order) {
+    function getRutNumeric(rut) {
+        return parseInt(rut.replace(/\./g, '').split('-')[0], 10) || 0;
+    }
+
+    // ─── Sort + rewrite ───────────────────────────────────────────────────────────
+
+    function applyOrder(order) {
         const optgroup = document.querySelector('select[name="RUT_EMP"] optgroup');
         if (!optgroup) return;
+
         const options = Array.from(optgroup.querySelectorAll('option'));
+
+        // Parsear y guardar en data attributes la primera vez
+        options.forEach(opt => {
+            if (!opt.dataset.nombre) {
+                const { nombre, rut } = parseOption(opt.textContent);
+                opt.dataset.nombre = nombre;
+                // Fallback: si el regex no encontró RUT en el texto, usar el value
+                opt.dataset.rut = rut || opt.value;
+            }
+        });
+
+        // Ordenar
         options.sort((a, b) =>
             order === 'alpha'
-                ? a.textContent.trim().localeCompare(b.textContent.trim(), 'es', { sensitivity: 'base' })
-                : getRutNumeric(a.value) - getRutNumeric(b.value)
+                ? a.dataset.nombre.localeCompare(b.dataset.nombre, 'es', { sensitivity: 'base' })
+                : getRutNumeric(a.dataset.rut) - getRutNumeric(b.dataset.rut)
         );
-        options.forEach(opt => optgroup.appendChild(opt));
+
+        // Reescribir texto y reinsertar
+        options.forEach(opt => {
+            opt.textContent = order === 'alpha'
+                ? `${opt.dataset.nombre} ${opt.dataset.rut}`
+                : `${opt.dataset.rut} ${opt.dataset.nombre}`;
+            optgroup.appendChild(opt);
+        });
     }
 
+    // ─── Botón ────────────────────────────────────────────────────────────────────
+
     function getLabel(order) {
-        return order === 'alpha' ? 'Empresas [A-Z]' : 'Empresas [0-9]';
+        return order === 'alpha' ? '🔤 Nombre [A-Z]' : '🔢 RUT [0-9]';
     }
 
     function init() {
+        // Ocultar el label original que queda debajo del botón
         const label = document.querySelector('label[for="RUT_EMP"]');
+        if (label) label.style.display = 'none';
+
         const select = document.querySelector('select[name="RUT_EMP"]');
-        if (!label || !select) return;
+        if (!select) return;
 
-        sortSelect(currentOrder);
+        // Evitar doble init
+        if (document.getElementById('sii-sort-btn')) return;
 
-        // Forzar el contenedor input-group a comportarse como flexbox
+        applyOrder(currentOrder);
+
+        // Contenedor flex
         const inputGroup = select.closest('.input-group') || select.parentElement;
-        inputGroup.style.cssText +=
-            'display:flex !important;' +
-            'flex-direction:row !important;' +
-            'align-items:stretch !important;' +
-            'flex-wrap:nowrap !important;';
+        Object.assign(inputGroup.style, {
+            display:       'flex',
+            flexDirection: 'row',
+            alignItems:    'stretch',
+            flexWrap:      'nowrap'
+        });
 
+        // Botón
         const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.title = 'Cambiar orden';
-        btn.setAttribute('style',
-            'cursor:pointer;' +
-            'flex-shrink:0;' +
-            'width:auto;' +
-            'min-width:140px;' +
-            'font-size:13px;' +
-            'font-weight:600;' +
-            'font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;' +
-            'padding:6px 14px;' +
-            'border:1px solid #2563eb;' +
-            'border-radius:4px 0 0 4px;' +
-            'border-right:none;' +
-            'background:linear-gradient(135deg,#1d4ed8,#2563eb);' +
-            'color:#fff;' +
-            'white-space:nowrap;' +
-            'box-sizing:border-box;'
-        );
+        btn.id          = 'sii-sort-btn';
+        btn.type        = 'button';
+        btn.title       = 'Cambiar orden';
         btn.textContent = getLabel(currentOrder);
 
-        // Ajustar select para pegarse al botón
-        select.style.cssText +=
-            'flex:1 !important;' +
-            'border-radius:0 4px 4px 0 !important;' +
-            'border-left:none !important;' +
-            'min-width:0 !important;';
+        Object.assign(btn.style, {
+            cursor:       'pointer',
+            flexShrink:   '0',
+            width:        'auto',
+            minWidth:     '160px',
+            fontSize:     '13px',
+            fontWeight:   '600',
+            fontFamily:   '"Helvetica Neue", Helvetica, Arial, sans-serif',
+            padding:      '6px 14px',
+            border:       '1px solid #2563eb',
+            borderRadius: '4px 0 0 4px',
+            borderRight:  'none',
+            background:   'linear-gradient(135deg, #1d4ed8, #2563eb)',
+            color:        '#fff',
+            whiteSpace:   'nowrap',
+            boxSizing:    'border-box',
+            transition:   'background 0.15s ease'
+        });
 
+        // Ajustar select para pegarse al botón
+        Object.assign(select.style, {
+            flex:         '1',
+            borderRadius: '0 4px 4px 0',
+            borderLeft:   'none',
+            minWidth:     '0'
+        });
+
+        // Hover
         btn.addEventListener('mouseenter', () => {
-            btn.style.background = 'linear-gradient(135deg,#1e40af,#1d4ed8)';
+            btn.style.background = 'linear-gradient(135deg, #1e40af, #1d4ed8)';
         });
         btn.addEventListener('mouseleave', () => {
-            btn.style.background = 'linear-gradient(135deg,#1d4ed8,#2563eb)';
+            btn.style.background = 'linear-gradient(135deg, #1d4ed8, #2563eb)';
         });
+
+        // Toggle al hacer click
         btn.addEventListener('click', () => {
             currentOrder = currentOrder === 'alpha' ? 'numeric' : 'alpha';
-            sortSelect(currentOrder);
+            localStorage.setItem(STORAGE_KEY, currentOrder);
+            applyOrder(currentOrder);
             btn.textContent = getLabel(currentOrder);
         });
 
-        label.replaceWith(btn);
+        // Insertar botón antes del select (sin tocar el label original)
+        select.insertAdjacentElement('beforebegin', btn);
     }
+
+    // ─── Arranque ─────────────────────────────────────────────────────────────────
 
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
     } else {
         init();
     }
+
 })();
