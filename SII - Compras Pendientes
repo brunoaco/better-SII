@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SII - Compras Pendientes
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Consulta y acuse masivo de compras pendientes por RUT
+// @version      2.3
+// @description  Consulta y acuse masivo de compras pendientes por RUT con reglas granulares
 // @author       Bruno
 // @match        https://www4.sii.cl/consdcvinternetui/*
 // @grant        none
@@ -11,6 +11,74 @@
 
 (async () => {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // ============================================================
+  // VARIABLE GLOBAL — interruptor maestro
+  // true  = respetar REGLAS_ACUSE para acusar
+  // false = solo consulta y conteo (nadie se acusa, ignora reglas)
+  // ============================================================
+  let MODO_ACUSE = true;
+
+  // ============================================================
+  // REGLAS DE ACUSE — granular por RUT y código de documento
+  //
+  // - Si el RUT está en la lista: solo se acusan los códigos indicados.
+  //   Los demás tipos se cuentan pero NO se acusan.
+  // - Si el RUT NO está en la lista: solo se cuenta, no se acusa nada.
+  //
+  // Ejemplos:
+  //   { rut: '10632103-5', codigos: [61] }        → solo Notas de Crédito
+  //   { rut: '76543210-2', codigos: [33, 34] }     → Facturas afectas y exentas
+  //   { rut: '12345678-9', codigos: [33, 34, 61] } → todos los tipos
+  // ============================================================
+  const REGLAS_ACUSE = [
+    { rut: '10632103-5', codigos: [61] },
+    // { rut: '76543210-2', codigos: [33, 34] },
+    // Agrega más reglas aquí...
+  ];
+
+  // ============================================================
+  // HELPERS DE EXTRACCIÓN
+  // ============================================================
+
+  // Extrae el código numérico del tipo de documento
+  // 1° intento: texto del link → "Factura Electrónica (33)" → 33
+  // 2° respaldo: href          → "#detalle/33"              → 33
+  const extraerCodigo = (link) => {
+    const desdeTexto = link.textContent.match(/\((\d+)\)/);
+    if (desdeTexto) return parseInt(desdeTexto[1]);
+    const desdeHref = link.getAttribute('href')?.match(/\/(\d+)$/);
+    return desdeHref ? parseInt(desdeHref[1]) : null;
+  };
+
+  // Determina si un RUT+código debe ser acusado según las reglas
+  // - MODO_ACUSE = false  → nunca acusar
+  // - MODO_ACUSE = true + RUT sin regla → acusar todo
+  // - MODO_ACUSE = true + RUT con regla → acusar solo los códigos indicados
+  const debeAcusar = (rut, codigo) => {
+    if (!MODO_ACUSE) return false;
+    const regla = REGLAS_ACUSE.find(r => r.rut === rut);
+    if (!regla) return true; // sin regla = acusar todo
+    return regla.codigos.includes(codigo);
+  };
+
+  // Lee la tabla resumen actual y devuelve los tipos con cantidad > 0
+  const leerTablaResumen = () => {
+    const items = [];
+    document.querySelectorAll('table.table tbody tr').forEach(tr => {
+      const celdas = tr.querySelectorAll('td');
+      if (celdas.length >= 2) {
+        const cantidad = parseInt(celdas[1].textContent.trim().replace(/\./g, '')) || 0;
+        const link     = celdas[0].querySelector('a[href*="detalle"]');
+        if (cantidad > 0 && link) {
+          items.push({ link, tipoDoc: link.textContent.trim(), cantidad, codigo: extraerCodigo(link) });
+        }
+      }
+    });
+    return items;
+  };
+
+  // ============================================================
 
   const waitFor = (condFn, timeout = 15000, interval = 400) => {
     return new Promise((resolve, reject) => {
@@ -43,6 +111,9 @@
       ? [...selectEl.options].filter(o => o.value !== '').map(o => o.value)
       : [];
 
+    const rutsConRegla = ruts.filter(r => REGLAS_ACUSE.find(re => re.rut === r));
+    const rutsSinRegla = ruts.filter(r => !REGLAS_ACUSE.find(re => re.rut === r));
+
     const overlay = document.createElement('div');
     overlay.id = modalId;
     overlay.style.cssText = `
@@ -57,7 +128,7 @@
         border-radius:12px; padding:28px 32px;
         box-shadow:0 8px 32px rgba(0,0,0,0.6);
         border:1px solid #313244;
-        max-width:420px; width:90%; text-align:center;
+        max-width:440px; width:90%; text-align:center;
       ">
         <div style="font-size:32px; margin-bottom:12px;">🔍</div>
         <div style="font-size:15px; font-weight:bold; color:#cba6f7; margin-bottom:10px;">
@@ -69,6 +140,50 @@
         <div style="background:#313244; border-radius:8px; padding:10px; margin:12px 0; color:#a6e3a1; font-size:14px;">
           📋 <strong>${ruts.length}</strong> RUTs del período actual
         </div>
+
+        <!-- Resumen de reglas -->
+        <div style="background:#313244; border-radius:8px; padding:10px 14px; margin:8px 0; text-align:left; font-size:11px;">
+          <div style="color:#cba6f7; font-weight:bold; margin-bottom:6px;">📜 Reglas de acuse configuradas:</div>
+          ${rutsConRegla.length > 0
+            ? rutsConRegla.map(r => {
+                const regla = REGLAS_ACUSE.find(re => re.rut === r);
+                return `<div style="color:#a6e3a1; padding:2px 0;">✅ ${r} → códigos [${regla.codigos.join(', ')}]</div>`;
+              }).join('')
+            : '<div style="color:#6c7086;">— Ningún RUT del período tiene reglas definidas —</div>'
+          }
+          ${rutsSinRegla.length > 0
+            ? `<div style="color:#a6adc8; margin-top:6px;">📋 ${rutsSinRegla.length} RUT(s) sin regla → se acusarán todos sus tipos</div>`
+            : ''
+          }
+        </div>
+
+        <!-- TOGGLE MODO -->
+        <div style="
+          background:#313244; border-radius:8px;
+          padding:12px 14px; margin:12px 0;
+          display:flex; align-items:center; justify-content:space-between;
+        ">
+          <div style="text-align:left;">
+            <div id="sii-modo-label" style="color:#a6e3a1; font-weight:bold; font-size:13px;">
+              Modo: Acuse de Recibo
+            </div>
+            <div id="sii-modo-desc" style="color:#a6adc8; font-size:11px; margin-top:3px;">
+              Acusará según las reglas definidas arriba
+            </div>
+          </div>
+          <div id="sii-toggle" style="
+            position:relative; width:48px; height:26px;
+            background:#a6e3a1; border-radius:13px;
+            cursor:pointer; transition:background 0.3s; flex-shrink:0; margin-left:12px;
+          ">
+            <div id="sii-toggle-knob" style="
+              position:absolute; top:3px; left:3px;
+              width:20px; height:20px; border-radius:50%;
+              background:#1e1e2e; transition:left 0.3s;
+            "></div>
+          </div>
+        </div>
+
         <div style="background:#45475a; border-radius:8px; padding:8px; margin:8px 0; color:#f9e2af; font-size:11px;">
           ⚠️ El acuse de recibo <strong>no puede ser reversado</strong>.<br>
           Solo se procesarán documentos con pendientes > 0.
@@ -92,8 +207,36 @@
       </div>
     `;
     document.body.appendChild(overlay);
-    document.getElementById('sii-btn-confirmar').onclick = () => { overlay.remove(); resolve(true); };
-    document.getElementById('sii-btn-cancelar').onclick  = () => { overlay.remove(); resolve(false); };
+
+    let modoActual = true;
+    const toggle    = document.getElementById('sii-toggle');
+    const knob      = document.getElementById('sii-toggle-knob');
+    const modoLabel = document.getElementById('sii-modo-label');
+    const modoDesc  = document.getElementById('sii-modo-desc');
+
+    toggle.addEventListener('click', () => {
+      modoActual = !modoActual;
+      if (modoActual) {
+        toggle.style.background = '#a6e3a1';
+        knob.style.left         = '3px';
+        modoLabel.style.color   = '#a6e3a1';
+        modoLabel.textContent   = 'Modo: Acuse de Recibo';
+        modoDesc.textContent    = 'Acusará según las reglas definidas arriba';
+      } else {
+        toggle.style.background = '#89b4fa';
+        knob.style.left         = '25px';
+        modoLabel.style.color   = '#89b4fa';
+        modoLabel.textContent   = 'Modo: Solo Consulta';
+        modoDesc.textContent    = 'Solo contará pendientes por tipo, sin acusar nada';
+      }
+    });
+
+    document.getElementById('sii-btn-confirmar').onclick = () => {
+      MODO_ACUSE = modoActual;
+      overlay.remove();
+      resolve(true);
+    };
+    document.getElementById('sii-btn-cancelar').onclick = () => { overlay.remove(); resolve(false); };
   });
 
   const confirmado = await esperarConfirmacion();
@@ -114,8 +257,16 @@
   `;
   panel.innerHTML = `
     <div style="background:#313244; padding:10px 14px; border-radius:10px 10px 0 0;
-                display:flex; justify-content:space-between; align-items:center;">
-      <span style="font-weight:bold; color:#cba6f7;">🔍 SII — Compras Pendientes</span>
+                display:flex; justify-content:space-between; align-items:center;
+                position:sticky; top:0; z-index:1;">
+      <span style="font-weight:bold; color:#cba6f7;">🔍 SII — Compras Pendientes
+        <span id="sii-modo-badge" style="
+          font-size:10px; margin-left:8px; padding:2px 7px;
+          border-radius:10px; vertical-align:middle;
+          background:${MODO_ACUSE ? '#a6e3a1' : '#89b4fa'};
+          color:#1e1e2e;
+        ">${MODO_ACUSE ? 'ACUSE' : 'CONSULTA'}</span>
+      </span>
       <button onclick="document.getElementById('${panelId}').remove()"
         style="background:none;border:none;color:#f38ba8;cursor:pointer;font-size:16px;">✕</button>
     </div>
@@ -130,7 +281,9 @@
         </div>
       </div>
       <div id="sii-current" style="color:#89b4fa; margin-bottom:8px; min-height:16px;"></div>
-      <div id="sii-log" style="max-height:380px;overflow-y:auto;border-top:1px solid #313244;padding-top:8px;"></div>
+      <div id="sii-log" style="max-height:280px;overflow-y:auto;border-top:1px solid #313244;padding-top:8px;"></div>
+      <!-- Resumen final anclado abajo, oculto hasta que termine -->
+      <div id="sii-resumen" style="display:none; border-top:2px solid #cba6f7; margin-top:8px; padding-top:8px;"></div>
     </div>
   `;
   document.body.appendChild(panel);
@@ -144,9 +297,9 @@
   const setCurrent = txt => document.getElementById('sii-current').textContent = txt;
   const addLog = (txt, color = '#a6e3a1') => {
     const log = document.getElementById('sii-log');
-    const el = document.createElement('div');
+    const el  = document.createElement('div');
     el.style.cssText = `padding:3px 0; border-bottom:1px solid #313244; color:${color};`;
-    el.textContent = txt;
+    el.textContent   = txt;
     log.appendChild(el);
     log.scrollTop = log.scrollHeight;
   };
@@ -160,37 +313,48 @@
       )
     );
 
-  const tablaVisible = () => !!document.querySelector('table.table tbody tr');
+  const tablaVisible     = () => !!document.querySelector('table.table tbody tr');
   const pendientesListas = () => tablaVisible() || sinPendientesVisible();
-
-  const modalVisible = (texto) =>
+  const modalVisible     = (texto) =>
     [...document.querySelectorAll('.modal.in, .modal[style*="block"]')]
       .some(m => m.textContent.includes(texto));
 
-  const clickAngular = (el) => {
-    el.click();
-    try {
-      const scope = angular.element(el).scope();
-      if (scope) scope.$apply();
-    } catch(e) {}
-  };
-
   const cerrarModalAlerta = async () => {
-    // Cerrar modal de alerta "No se encontraron documentos"
+    // Cierra cualquier modal visible que tenga un botón "Cerrar"
+    // Cubre tanto modales Bootstrap (data-dismiss) como Angular (ng-click)
     const btnCerrar = [...document.querySelectorAll('.modal.in button, .modal[style*="block"] button')]
-      .find(b => b.textContent.trim() === 'Cerrar' && b.classList.contains('btn-danger'));
+      .find(b => b.textContent.trim() === 'Cerrar');
     if (btnCerrar) { btnCerrar.click(); await sleep(500); }
   };
 
+  // Navega a pestaña Pendientes y espera que cargue la tabla resumen
+  const volverAPendientes = async () => {
+    const tab = document.querySelector('a[ui-sref="compraPendiente"]');
+    if (tab) { tab.click(); await sleep(800); }
+    try { await waitFor(pendientesListas, 12000); } catch(e) {}
+    await sleep(300);
+  };
+
   // --- PROCESAR ACUSE PARA UN TIPO DE DOCUMENTO ---
-  const procesarAcuse = async (rut, linkEl, tipoDoc) => {
+  // linkEl puede ser null si se llama desde el resumen (se buscará el link en la tabla actual)
+  const procesarAcuse = async (rut, linkEl, tipoDoc, codigo) => {
     addLog(`   📂 Abriendo: ${tipoDoc}`, '#89b4fa');
 
-    // 1. Click en el link del tipo de documento
-    linkEl.click();
+    // Si no tenemos el link en memoria, lo buscamos en la tabla actual por código
+    let link = linkEl;
+    if (!link) {
+      const items = leerTablaResumen();
+      const found = items.find(i => i.codigo === codigo);
+      if (!found) { addLog(`   ⚠️ No se encontró el link para código ${codigo}`, '#f9e2af'); return false; }
+      link = found.link;
+    }
+
+    link.click();
     await sleep(1500);
 
-    // 2. Esperar tabla #tableCompra
+    // Cerrar modal de alerta si apareció al abrir el detalle
+    await cerrarModalAlerta();
+
     try {
       await waitFor(() => {
         const tabla = document.querySelector('#tableCompra');
@@ -198,79 +362,71 @@
       }, 12000);
     } catch(e) {
       addLog(`   ⏱️ Timeout esperando tabla: ${tipoDoc}`, '#f38ba8');
-      return;
+      return false;
     }
     await sleep(500);
 
-    // 3. Click select_all
     const checkAll = document.querySelector('#select_all');
-    if (!checkAll) { addLog(`   ⚠️ No se encontró checkbox select_all`, '#f9e2af'); return; }
+    if (!checkAll) { addLog(`   ⚠️ No se encontró checkbox select_all`, '#f9e2af'); return false; }
     checkAll.click();
     await sleep(500);
 
-    // 4. Click "Acuse de Recibo Masivo"
     const btnAcuse = [...document.querySelectorAll('button')]
       .find(b => b.textContent.includes('Acuse de Recibo Masivo'));
-    if (!btnAcuse) { addLog(`   ⚠️ No se encontró botón Acuse Masivo`, '#f9e2af'); return; }
+    if (!btnAcuse) { addLog(`   ⚠️ No se encontró botón Acuse Masivo`, '#f9e2af'); return false; }
     btnAcuse.click();
     await sleep(1000);
 
-    // 5. Esperar modal 1 y seleccionar ERM
     try {
       await waitFor(() => modalVisible('Acuse de Recibo Masivo'), 8000);
     } catch(e) {
       addLog(`   ⏱️ Timeout esperando modal Acuse Masivo`, '#f38ba8');
-      return;
+      return false;
     }
 
     const selectEvento = document.querySelector('#evento');
-    if (!selectEvento) { addLog(`   ⚠️ No se encontró select de evento`, '#f9e2af'); return; }
+    if (!selectEvento) { addLog(`   ⚠️ No se encontró select de evento`, '#f9e2af'); return false; }
 
-    // Seleccionar ERM via Angular
     const scopeSelect = angular.element(selectEvento).scope();
     scopeSelect.$apply(() => { scopeSelect.evento = 'ERM'; });
     selectEvento.value = 'ERM';
     await sleep(500);
 
-    // 6. Click "Confirmar"
     const btnConfirmar = [...document.querySelectorAll('.modal.in button, .modal[style*="block"] button')]
       .find(b => b.textContent.trim() === 'Confirmar' && b.type === 'submit');
-    if (!btnConfirmar) { addLog(`   ⚠️ No se encontró botón Confirmar`, '#f9e2af'); return; }
+    if (!btnConfirmar) { addLog(`   ⚠️ No se encontró botón Confirmar`, '#f9e2af'); return false; }
     btnConfirmar.click();
     await sleep(1000);
 
-    // 7. Esperar modal 2 de confirmación y click "Aceptar"
     try {
       await waitFor(() => modalVisible('¿Esta seguro'), 8000);
     } catch(e) {
       addLog(`   ⏱️ Timeout esperando modal confirmación`, '#f38ba8');
-      return;
+      return false;
     }
 
     const btnAceptar = [...document.querySelectorAll('.modal.in button, .modal[style*="block"] button')]
       .find(b => b.getAttribute('ng-click') === 'acusarReclamar()');
-    if (!btnAceptar) { addLog(`   ⚠️ No se encontró botón Aceptar`, '#f9e2af'); return; }
+    if (!btnAceptar) { addLog(`   ⚠️ No se encontró botón Aceptar`, '#f9e2af'); return false; }
     btnAceptar.click();
     await sleep(2000);
 
-    // 8. Esperar modal 3 de resultados y cerrarlo
+    let exito = false;
     try {
       await waitFor(() => modalVisible('Resultado Acuse'), 10000);
       const btnCerrar = [...document.querySelectorAll('.modal.in button, .modal[style*="block"] button')]
         .find(b => b.getAttribute('ng-click') === 'close()');
       if (btnCerrar) { btnCerrar.click(); await sleep(800); }
       addLog(`   ✅ Acuse completado: ${tipoDoc}`, '#a6e3a1');
+      exito = true;
     } catch(e) {
-      // Puede que haya aparecido la alerta de "No se encontraron documentos"
       await cerrarModalAlerta();
       addLog(`   ℹ️ Sin documentos para acusar: ${tipoDoc}`, '#6c7086');
     }
 
     await sleep(800);
-
-    // 9. Volver a la vista de pendientes
-    const tabPendiente = document.querySelector('a[ui-sref="compraPendiente"]');
-    if (tabPendiente) { tabPendiente.click(); await sleep(1000); }
+    await volverAPendientes();
+    return exito;
   };
 
   // --- LÓGICA PRINCIPAL ---
@@ -289,18 +445,20 @@
     setProgress(i + 1, ruts.length);
     addLog(`\n🔄 [${i+1}/${ruts.length}] RUT: ${rut}`, '#cba6f7');
 
-    // Seleccionar RUT
-    const sel = document.querySelector('select[name="rut"]');
+    const reglaRut = REGLAS_ACUSE.find(r => r.rut === rut);
+    if (MODO_ACUSE && reglaRut) {
+      addLog(`   📜 Regla: acusar códigos [${reglaRut.codigos.join(', ')}]`, '#cba6f7');
+    }
+
+    const sel   = document.querySelector('select[name="rut"]');
     const scope = angular.element(sel).scope();
     scope.$apply(() => { scope.rut = rut; });
     sel.value = rut;
     await sleep(300);
 
-    // Consultar
     document.querySelector('button[type="submit"]').click();
     await sleep(1200);
 
-    // Esperar pestaña Pendientes
     try {
       await waitFor(() => !!document.querySelector('a[ui-sref="compraPendiente"]'), 15000);
     } catch(e) {
@@ -309,11 +467,9 @@
       continue;
     }
 
-    // Click Pendientes
     document.querySelector('a[ui-sref="compraPendiente"]').click();
     await sleep(800);
 
-    // Esperar contenido
     try {
       await waitFor(pendientesListas, 15000);
     } catch(e) {
@@ -323,52 +479,208 @@
     }
     await sleep(300);
 
-    // Sin pendientes
     if (sinPendientesVisible()) {
       addLog(`   ℹ️ Sin pendientes`, '#6c7086');
       resultados.push({ rut, totalDocumentos: 0, detalle: [] });
       continue;
     }
 
-    // Leer links con pendientes > 0 desde la tabla resumen
-    const linksConPendientes = [];
-    document.querySelectorAll('table.table tbody tr').forEach(tr => {
-      const celdas = tr.querySelectorAll('td');
-      if (celdas.length >= 2) {
-        const cantidad = parseInt(celdas[1].textContent.trim().replace(/\./g, '')) || 0;
-        const link = celdas[0].querySelector('a[href*="detalle"]');
-        if (cantidad > 0 && link) {
-          linksConPendientes.push({ link, tipoDoc: link.textContent.trim(), cantidad });
-        }
-      }
-    });
+    // Lectura inicial
+    let itemsActuales = leerTablaResumen();
 
-    if (linksConPendientes.length === 0) {
+    if (itemsActuales.length === 0) {
       addLog(`   ℹ️ Sin links con pendientes > 0`, '#6c7086');
       resultados.push({ rut, totalDocumentos: 0, detalle: [] });
       continue;
     }
 
-    const total = linksConPendientes.reduce((s, l) => s + l.cantidad, 0);
-    addLog(`   ⚠️ ${total} pendientes en ${linksConPendientes.length} tipo(s)`, '#f9e2af');
+    const detalleRut = itemsActuales.map(l => ({
+      tipoDoc:  l.tipoDoc,
+      codigo:   l.codigo,
+      cantidad: l.cantidad,
+      acusado:  false,
+    }));
 
-    // Procesar acuse para cada tipo de documento
-    for (const { link, tipoDoc, cantidad } of linksConPendientes) {
-      addLog(`   📋 ${tipoDoc}: ${cantidad} docs`, '#f9e2af');
-      await procesarAcuse(rut, link, tipoDoc);
+    // Procesar acuse con recarga entre tipos
+    if (MODO_ACUSE) {
+      let hayMas = true;
+      while (hayMas) {
+        // Releer tabla fresca en cada iteración
+        itemsActuales = leerTablaResumen();
+        const siguiente = itemsActuales.find(i => debeAcusar(rut, i.codigo));
+        if (!siguiente) { hayMas = false; break; }
+
+        const { tipoDoc, cantidad, codigo } = siguiente;
+        addLog(`   ✅ [${codigo}] ${tipoDoc}: ${cantidad} docs (acusar)`, '#f9e2af');
+        const exito = await procesarAcuse(rut, null, tipoDoc, codigo);
+
+        if (exito) {
+          // Marcar como acusado en el detalle
+          const entry = detalleRut.find(d => d.codigo === codigo);
+          if (entry) entry.acusado = true;
+        } else {
+          // Si falló, no reintentamos este tipo para evitar loop infinito
+          break;
+        }
+      }
+
+      // Loguear los que solo se cuentan
+      itemsActuales = leerTablaResumen();
+      for (const i of itemsActuales) {
+        if (!debeAcusar(rut, i.codigo)) {
+          addLog(`   👁️ [${i.codigo}] ${i.tipoDoc}: ${i.cantidad} docs (solo contar)`, '#6c7086');
+          const entry = detalleRut.find(d => d.codigo === i.codigo);
+          if (entry) { entry.cantidad = i.cantidad; entry.acusado = false; }
+        }
+      }
+    } else {
+      // Modo solo consulta: loguear todo
+      for (const i of itemsActuales) {
+        addLog(`   👁️ [${i.codigo}] ${i.tipoDoc}: ${i.cantidad} docs`, '#6c7086');
+      }
     }
 
-    resultados.push({ rut, totalDocumentos: total, detalle: linksConPendientes.map(l => ({ tipoDoc: l.tipoDoc, cantidad: l.cantidad })) });
+    const total = detalleRut.reduce((s, d) => s + (typeof d.cantidad === 'number' ? d.cantidad : 0), 0);
+    resultados.push({ rut, totalDocumentos: total, detalle: detalleRut });
     await sleep(1000);
   }
 
-  // Resumen final
+  // ============================================================
+  // RESUMEN FINAL — sección separada, siempre visible
+  // ============================================================
   setCurrent('✔ Proceso completado');
+
   const conPendientes = resultados.filter(r => r.totalDocumentos > 0);
-  addLog(`\n========== RESUMEN FINAL ==========`, '#cba6f7');
-  addLog(`✅ RUTs procesados: ${resultados.length}`, '#a6e3a1');
-  addLog(`⚠️ Con pendientes acusados: ${conPendientes.length}`, '#f9e2af');
-  if (conPendientes.length === 0) addLog(`🎉 Sin pendientes en ningún RUT`, '#a6e3a1');
+  const totalAcusados = resultados.reduce((s, r) =>
+    s + r.detalle.filter(d => d.acusado).reduce((ss, d) => ss + d.cantidad, 0), 0);
+
+  const rutsConSinAcusar = resultados
+    .map(r => ({ ...r, detalle: r.detalle.filter(d => !d.acusado && d.cantidad > 0) }))
+    .filter(r => r.detalle.length > 0);
+
+  // Construir sección resumen como DOM para poder hacer scroll y agregar clicks
+  const resumenEl = document.getElementById('sii-resumen');
+  resumenEl.style.display = 'block';
+
+  const addResumen = (txt, color = '#a6e3a1', extra = {}) => {
+    const el = document.createElement('div');
+    el.style.cssText = `padding:3px 0; border-bottom:1px solid #313244; color:${color};`;
+    el.textContent   = txt;
+    if (extra.id)        el.id = extra.id;
+    if (extra.title)     el.title = extra.title;
+    if (extra.onClick)   el.style.cursor = 'pointer';
+    if (extra.onClick)   el.addEventListener('click', extra.onClick);
+    resumenEl.appendChild(el);
+    return el;
+  };
+
+  addResumen(`========== RESUMEN FINAL ==========`, '#cba6f7');
+  addResumen(`✅ RUTs procesados: ${resultados.length}`, '#a6e3a1');
+  addResumen(`⚠️ Con pendientes: ${conPendientes.length}`, '#f9e2af');
+  if (MODO_ACUSE) {
+    addResumen(`📨 Documentos acusados: ${totalAcusados}`, '#a6e3a1');
+  } else {
+    addResumen(`👁️ Modo solo consulta — ningún documento fue acusado`, '#89b4fa');
+  }
+
+  if (rutsConSinAcusar.length === 0) {
+    addResumen(`🎉 Sin pendientes sin acusar en ningún RUT`, '#a6e3a1');
+  } else {
+    addResumen(`\n--- Pendientes sin acusar ---`, '#cba6f7');
+
+    // Helper: navegar al RUT indicado y dejar la pestaña Pendientes cargada
+    const navegarARut = async (rut) => {
+      const sel2   = document.querySelector('select[name="rut"]');
+      const scope2 = angular.element(sel2).scope();
+      scope2.$apply(() => { scope2.rut = rut; });
+      sel2.value = rut;
+      await sleep(300);
+      document.querySelector('button[type="submit"]').click();
+      await sleep(1200);
+      try { await waitFor(() => !!document.querySelector('a[ui-sref="compraPendiente"]'), 12000); } catch(e) {}
+      await volverAPendientes();
+    };
+
+    for (const r of rutsConSinAcusar) {
+      // Mapa de elementos DOM por código para poder actualizarlos desde el click del RUT
+      const elsPorCodigo = {};
+
+      // Línea del RUT — click acusa todos sus tipos en secuencia
+      const elRut = addResumen(`📂 ${r.rut}  ▶ acusar todo`, '#f9e2af', {
+        title: 'Click para acusar todos los tipos pendientes de este RUT',
+        onClick: async () => {
+          elRut.style.pointerEvents = 'none';
+          elRut.textContent         = `📂 ${r.rut}  ⏳ procesando...`;
+
+          await navegarARut(r.rut);
+
+          let alguno = false;
+          for (const d of r.detalle) {
+            const elDoc = elsPorCodigo[d.codigo];
+            if (!elDoc || elDoc.dataset.acusado === 'true') continue; // ya acusado
+
+            elDoc.style.pointerEvents = 'none';
+            elDoc.textContent         = `   ⏳ [${d.codigo}] ${d.tipoDoc}: procesando...`;
+            elDoc.style.color         = '#f9e2af';
+
+            const exito = await procesarAcuse(r.rut, null, d.tipoDoc, d.codigo);
+
+            if (exito) {
+              elDoc.textContent          = `   ✅ [${d.codigo}] ${d.tipoDoc}: acusado`;
+              elDoc.style.color          = '#a6e3a1';
+              elDoc.style.textDecoration = 'line-through';
+              elDoc.dataset.acusado      = 'true';
+              alguno = true;
+            } else {
+              elDoc.textContent          = `   ❌ [${d.codigo}] ${d.tipoDoc}: falló`;
+              elDoc.style.color          = '#f38ba8';
+              elDoc.style.pointerEvents  = 'auto';
+            }
+          }
+
+          elRut.textContent = alguno
+            ? `📂 ${r.rut}  ✅ completado`
+            : `📂 ${r.rut}  ❌ sin cambios`;
+          elRut.style.textDecoration = alguno ? 'line-through' : 'none';
+          elRut.style.color          = alguno ? '#a6e3a1' : '#f38ba8';
+        }
+      });
+
+      // Líneas individuales por tipo de documento
+      for (const d of r.detalle) {
+        const el = addResumen(
+          `   👁️ [${d.codigo}] ${d.tipoDoc}: ${d.cantidad}`,
+          '#6c7086',
+          {
+            title: 'Click para acusar solo este tipo de documento',
+            onClick: async () => {
+              el.style.pointerEvents = 'none';
+              el.textContent         = `   ⏳ [${d.codigo}] ${d.tipoDoc}: procesando...`;
+              el.style.color         = '#f9e2af';
+
+              await navegarARut(r.rut);
+              const exito = await procesarAcuse(r.rut, null, d.tipoDoc, d.codigo);
+
+              if (exito) {
+                el.textContent          = `   ✅ [${d.codigo}] ${d.tipoDoc}: acusado`;
+                el.style.color          = '#a6e3a1';
+                el.style.textDecoration = 'line-through';
+                el.dataset.acusado      = 'true';
+              } else {
+                el.textContent         = `   ❌ [${d.codigo}] ${d.tipoDoc}: falló`;
+                el.style.color         = '#f38ba8';
+                el.style.pointerEvents = 'auto';
+              }
+            }
+          }
+        );
+        elsPorCodigo[d.codigo] = el;
+      }
+    }
+  }
+
+  // Scroll para mostrar el resumen final
+  resumenEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
   console.log('\n📋 JSON:', JSON.stringify(resultados, null, 2));
 
