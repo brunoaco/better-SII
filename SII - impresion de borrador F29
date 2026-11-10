@@ -1,0 +1,99 @@
+// ==UserScript==
+// @name         SII F29 - Botón IMPRESIÓN
+// @namespace    https://www4.sii.cl/
+// @version      1.0
+// @description  Agrega un botón para imprimir el borrador del Formulario 29 limpio, sin hojas en blanco ni columnas cortadas
+// @match        https://www4.sii.cl/rfiInternet/consulta/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ---- AJUSTES ----
+  const TEXTO_BOTON = 'IMPRESIÓN';
+  const PAPEL       = 'letter';    // 'letter' o 'A4'
+  const ORIENTACION = 'portrait';  // 'portrait' o 'landscape'
+  const MARGEN_MM   = 8;
+  const ANCHO_PX    = 734;         // ancho de diseño del F29 (landscape: prueba ~1000)
+  // -----------------
+
+  function imprimirF29() {
+    const panels = [...document.querySelectorAll('.padded-bel-panel')];
+    if (!panels.length) return alert('No encontré el formulario');
+    const title  = document.querySelector('.form-title')?.outerHTML || '';
+    const links  = [...document.querySelectorAll('link[rel=stylesheet]')]
+      .map(l => `<link rel="stylesheet" href="${l.href}">`).join('');
+    const styles = [...document.querySelectorAll('style')]
+      .map(s => s.outerHTML).join('');
+
+    const mm   = 96 / 25.4;
+    const dims = { letter: [215.9, 279.4], A4: [210, 297] }[PAPEL];
+    const pageW = ORIENTACION === 'landscape' ? dims[1] : dims[0];
+    const printable = Math.floor((pageW - 2 * MARGEN_MM) * mm) - 2;
+
+    const body = panels.map(p => {
+      const c = p.cloneNode(true);
+      c.style.cssText = `width:${ANCHO_PX}px !important`;
+      c.querySelectorAll('table')
+        .forEach(t => t.style.setProperty('width', ANCHO_PX + 'px', 'important'));
+      return c.outerHTML;
+    }).join('');
+
+    const w = window.open('', '_blank');
+    if (!w) return alert('El navegador bloqueó la ventana emergente. Permítela para sii.cl.');
+    w.document.write(`<!doctype html><html><head><meta charset="utf-8">
+<title>Formulario 29</title>${links}${styles}
+<style>
+  @page { size: ${PAPEL} ${ORIENTACION}; margin: ${MARGEN_MM}mm; }
+  html, body { margin: 0; background: #fff; }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  #f29wrap { width: ${ANCHO_PX}px; }
+  tr { break-inside: avoid; }
+</style></head>
+<body><div id="f29wrap">${title}${body}</div></body></html>`);
+    w.document.close();
+
+    let listo = false;
+    const imprimir = () => {
+      if (listo) return; listo = true;
+      // Seguro extra: si algo midiera más que la hoja, se achica para que NO se corte
+      const wrap = w.document.getElementById('f29wrap');
+      wrap.style.zoom = 1;
+      const real = Math.max(wrap.scrollWidth,
+        ...[...w.document.querySelectorAll('table')].map(t => t.getBoundingClientRect().width));
+      wrap.style.zoom = Math.min(1, printable / real);
+      w.print();
+    };
+    w.onload = () => setTimeout(imprimir, 400);
+    setTimeout(imprimir, 3000);
+  }
+
+  // ---- Botón flotante (solo aparece cuando el formulario está cargado) ----
+  const btn = document.createElement('button');
+  btn.id = 'f29-btn-impresion';
+  btn.type = 'button';
+  btn.textContent = TEXTO_BOTON;
+  btn.style.cssText = [
+    'position:fixed', 'right:20px', 'bottom:20px', 'z-index:2147483647',
+    'padding:12px 22px', 'font:bold 14px Arial,sans-serif', 'color:#fff',
+    'background:#337ab7', 'border:1px solid #2e6da4', 'border-radius:4px',
+    'cursor:pointer', 'box-shadow:0 2px 6px rgba(0,0,0,.35)', 'display:none'
+  ].join(';');
+  btn.onmouseenter = () => (btn.style.background = '#002c48');
+  btn.onmouseleave = () => (btn.style.background = '#337ab7');
+  btn.onclick = imprimirF29;
+  document.body.appendChild(btn);
+
+  // El F29 se carga dinámicamente (GWT): se revisa cada segundo si ya está en pantalla
+  setInterval(() => {
+    const hayF29 = document.querySelector('.padded-bel-panel .borde_tabla_f29_xslt');
+    btn.style.display = hayF29 ? 'block' : 'none';
+  }, 1000);
+
+  // El botón no sale en la impresión normal de la página
+  const st = document.createElement('style');
+  st.textContent = '@media print { #f29-btn-impresion { display:none !important; } }';
+  document.head.appendChild(st);
+})();
