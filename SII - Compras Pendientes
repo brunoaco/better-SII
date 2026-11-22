@@ -27,12 +27,12 @@
   // - Si el RUT NO está en la lista: solo se cuenta, no se acusa nada.
   //
   // Ejemplos:
-  //   { rut: '10632103-5', codigos: [61] }        → solo Notas de Crédito
+  //   { rut: '12345678-9', codigos: [61] }        → solo Notas de Crédito
   //   { rut: '76543210-2', codigos: [33, 34] }     → Facturas afectas y exentas
   //   { rut: '12345678-9', codigos: [33, 34, 61] } → todos los tipos
   // ============================================================
   const REGLAS_ACUSE = [
-    { rut: '10632103-5', codigos: [61] },
+    { rut: '12345678-9', codigos: [61] },
     // { rut: '76543210-2', codigos: [33, 34] },
     // Agrega más reglas aquí...
   ];
